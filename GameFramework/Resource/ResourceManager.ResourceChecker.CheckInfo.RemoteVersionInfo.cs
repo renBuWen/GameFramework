@@ -1,17 +1,17 @@
 ﻿//------------------------------------------------------------
 // Game Framework
-// Copyright © 2013-2019 Jiang Yin. All rights reserved.
-// Homepage: http://gameframework.cn/
-// Feedback: mailto:jiangyin@gameframework.cn
+// Copyright © 2013-2020 Jiang Yin. All rights reserved.
+// Homepage: https://gameframework.cn/
+// Feedback: mailto:ellan@gameframework.cn
 //------------------------------------------------------------
 
 namespace GameFramework.Resource
 {
-    internal partial class ResourceManager
+    internal sealed partial class ResourceManager : GameFrameworkModule, IResourceManager
     {
-        private partial class ResourceChecker
+        private sealed partial class ResourceChecker
         {
-            private partial class CheckInfo
+            private sealed partial class CheckInfo
             {
                 /// <summary>
                 /// 远程资源状态信息。
@@ -19,15 +19,17 @@ namespace GameFramework.Resource
                 private struct RemoteVersionInfo
                 {
                     private readonly bool m_Exist;
+                    private readonly string m_FileSystemName;
                     private readonly LoadType m_LoadType;
                     private readonly int m_Length;
                     private readonly int m_HashCode;
                     private readonly int m_ZipLength;
                     private readonly int m_ZipHashCode;
 
-                    public RemoteVersionInfo(LoadType loadType, int length, int hashCode, int zipLength, int zipHashCode)
+                    public RemoteVersionInfo(string fileSystemName, LoadType loadType, int length, int hashCode, int zipLength, int zipHashCode)
                     {
                         m_Exist = true;
+                        m_FileSystemName = fileSystemName;
                         m_LoadType = loadType;
                         m_Length = length;
                         m_HashCode = hashCode;
@@ -40,6 +42,22 @@ namespace GameFramework.Resource
                         get
                         {
                             return m_Exist;
+                        }
+                    }
+
+                    public bool UseFileSystem
+                    {
+                        get
+                        {
+                            return !string.IsNullOrEmpty(m_FileSystemName);
+                        }
+                    }
+
+                    public string FileSystemName
+                    {
+                        get
+                        {
+                            return m_FileSystemName;
                         }
                     }
 

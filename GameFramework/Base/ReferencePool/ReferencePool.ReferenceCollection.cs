@@ -1,4 +1,11 @@
-﻿using System;
+﻿//------------------------------------------------------------
+// Game Framework
+// Copyright © 2013-2020 Jiang Yin. All rights reserved.
+// Homepage: https://gameframework.cn/
+// Feedback: mailto:ellan@gameframework.cn
+//------------------------------------------------------------
+
+using System;
 using System.Collections.Generic;
 
 namespace GameFramework
@@ -124,7 +131,7 @@ namespace GameFramework
                 reference.Clear();
                 lock (m_References)
                 {
-                    if (m_References.Contains(reference))
+                    if (m_EnableStrictCheck && m_References.Contains(reference))
                     {
                         throw new GameFrameworkException("The reference has been released.");
                     }

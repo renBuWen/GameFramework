@@ -1,39 +1,58 @@
 ﻿//------------------------------------------------------------
 // Game Framework
-// Copyright © 2013-2019 Jiang Yin. All rights reserved.
-// Homepage: http://gameframework.cn/
-// Feedback: mailto:jiangyin@gameframework.cn
+// Copyright © 2013-2020 Jiang Yin. All rights reserved.
+// Homepage: https://gameframework.cn/
+// Feedback: mailto:ellan@gameframework.cn
 //------------------------------------------------------------
 
 using System.Collections.Generic;
 
 namespace GameFramework.Resource
 {
-    internal partial class ResourceManager
+    internal sealed partial class ResourceManager : GameFrameworkModule, IResourceManager
     {
         /// <summary>
         /// 资源组。
         /// </summary>
-        private sealed class ResourceGroup
+        private sealed class ResourceGroup : IResourceGroup
         {
+            private readonly string m_Name;
             private readonly Dictionary<ResourceName, ResourceInfo> m_ResourceInfos;
-            private readonly List<ResourceName> m_ResourceNames;
-            private int m_TotalLength;
+            private readonly HashSet<ResourceName> m_ResourceNames;
+            private long m_TotalLength;
+            private long m_TotalZipLength;
 
             /// <summary>
             /// 初始化资源组的新实例。
             /// </summary>
+            /// <param name="name">资源组名称。</param>
             /// <param name="resourceInfos">资源信息引用。</param>
-            public ResourceGroup(Dictionary<ResourceName, ResourceInfo> resourceInfos)
+            public ResourceGroup(string name, Dictionary<ResourceName, ResourceInfo> resourceInfos)
             {
+                if (name == null)
+                {
+                    throw new GameFrameworkException("Name is invalid.");
+                }
+
                 if (resourceInfos == null)
                 {
                     throw new GameFrameworkException("Resource infos is invalid.");
                 }
 
+                m_Name = name;
                 m_ResourceInfos = resourceInfos;
-                m_ResourceNames = new List<ResourceName>();
-                m_TotalLength = 0;
+                m_ResourceNames = new HashSet<ResourceName>();
+            }
+
+            /// <summary>
+            /// 获取资源组名称。
+            /// </summary>
+            public string Name
+            {
+                get
+                {
+                    return m_Name;
+                }
             }
 
             /// <summary>
@@ -43,14 +62,14 @@ namespace GameFramework.Resource
             {
                 get
                 {
-                    return ReadyResourceCount >= ResourceCount;
+                    return ReadyCount >= TotalCount;
                 }
             }
 
             /// <summary>
-            /// 获取资源组资源数量。
+            /// 获取资源组包含资源数量。
             /// </summary>
-            public int ResourceCount
+            public int TotalCount
             {
                 get
                 {
@@ -59,29 +78,30 @@ namespace GameFramework.Resource
             }
 
             /// <summary>
-            /// 获取资源组已准备完成资源数量。
+            /// 获取资源组中已准备完成资源数量。
             /// </summary>
-            public int ReadyResourceCount
+            public int ReadyCount
             {
                 get
                 {
-                    int readyResourceCount = 0;
+                    int readyCount = 0;
                     foreach (ResourceName resourceName in m_ResourceNames)
                     {
-                        if (m_ResourceInfos.ContainsKey(resourceName))
+                        ResourceInfo resourceInfo = null;
+                        if (m_ResourceInfos.TryGetValue(resourceName, out resourceInfo) && resourceInfo.Ready)
                         {
-                            readyResourceCount++;
+                            readyCount++;
                         }
                     }
 
-                    return readyResourceCount;
+                    return readyCount;
                 }
             }
 
             /// <summary>
-            /// 获取资源组总大小。
+            /// 获取资源组包含资源的总大小。
             /// </summary>
-            public int TotalLength
+            public long TotalLength
             {
                 get
                 {
@@ -90,17 +110,28 @@ namespace GameFramework.Resource
             }
 
             /// <summary>
-            /// 获取资源组已准备完成总大小。
+            /// 获取资源组包含资源压缩后的总大小。
             /// </summary>
-            public int TotalReadyLength
+            public long TotalZipLength
             {
                 get
                 {
-                    int totalReadyLength = 0;
+                    return m_TotalZipLength;
+                }
+            }
+
+            /// <summary>
+            /// 获取资源组中已准备完成资源的总大小。
+            /// </summary>
+            public long ReadyLength
+            {
+                get
+                {
+                    long totalReadyLength = 0L;
                     foreach (ResourceName resourceName in m_ResourceNames)
                     {
-                        ResourceInfo resourceInfo = default(ResourceInfo);
-                        if (m_ResourceInfos.TryGetValue(resourceName, out resourceInfo))
+                        ResourceInfo resourceInfo = null;
+                        if (m_ResourceInfos.TryGetValue(resourceName, out resourceInfo) && resourceInfo.Ready)
                         {
                             totalReadyLength += resourceInfo.Length;
                         }
@@ -111,26 +142,105 @@ namespace GameFramework.Resource
             }
 
             /// <summary>
-            /// 获取资源组准备进度。
+            /// 获取资源组的完成进度。
             /// </summary>
             public float Progress
             {
                 get
                 {
-                    return TotalLength > 0 ? (float)TotalReadyLength / TotalLength : 1f;
+                    return m_TotalLength > 0L ? (float)ReadyLength / m_TotalLength : 1f;
                 }
+            }
+
+            /// <summary>
+            /// 获取资源组包含的资源名称列表。
+            /// </summary>
+            /// <returns>资源组包含的资源名称列表。</returns>
+            public string[] GetResourceNames()
+            {
+                int index = 0;
+                string[] resourceNames = new string[m_ResourceNames.Count];
+                foreach (ResourceName resourceName in m_ResourceNames)
+                {
+                    resourceNames[index++] = resourceName.FullName;
+                }
+
+                return resourceNames;
+            }
+
+            /// <summary>
+            /// 获取资源组包含的资源名称列表。
+            /// </summary>
+            /// <param name="results">资源组包含的资源名称列表。</param>
+            public void GetResourceNames(List<string> results)
+            {
+                if (results == null)
+                {
+                    throw new GameFrameworkException("Results is invalid.");
+                }
+
+                results.Clear();
+                foreach (ResourceName resourceName in m_ResourceNames)
+                {
+                    results.Add(resourceName.FullName);
+                }
+            }
+
+            /// <summary>
+            /// 获取资源组包含的资源名称列表。
+            /// </summary>
+            /// <returns>资源组包含的资源名称列表。</returns>
+            public ResourceName[] InternalGetResourceNames()
+            {
+                int index = 0;
+                ResourceName[] resourceNames = new ResourceName[m_ResourceNames.Count];
+                foreach (ResourceName resourceName in m_ResourceNames)
+                {
+                    resourceNames[index++] = resourceName;
+                }
+
+                return resourceNames;
+            }
+
+            /// <summary>
+            /// 获取资源组包含的资源名称列表。
+            /// </summary>
+            /// <param name="results">资源组包含的资源名称列表。</param>
+            public void InternalGetResourceNames(List<ResourceName> results)
+            {
+                if (results == null)
+                {
+                    throw new GameFrameworkException("Results is invalid.");
+                }
+
+                results.Clear();
+                foreach (ResourceName resourceName in m_ResourceNames)
+                {
+                    results.Add(resourceName);
+                }
+            }
+
+            /// <summary>
+            /// 检查指定资源是否属于资源组。
+            /// </summary>
+            /// <param name="resourceName">要检查的资源的名称。</param>
+            /// <returns>指定资源是否属于资源组。</returns>
+            public bool HasResource(ResourceName resourceName)
+            {
+                return m_ResourceNames.Contains(resourceName);
             }
 
             /// <summary>
             /// 向资源组中增加资源。
             /// </summary>
-            /// <param name="name">资源名称。</param>
-            /// <param name="variant">变体名称。</param>
+            /// <param name="resourceName">资源名称。</param>
             /// <param name="length">资源大小。</param>
-            public void AddResource(string name, string variant, int length)
+            /// <param name="zipLength">资源压缩后的大小。</param>
+            public void AddResource(ResourceName resourceName, int length, int zipLength)
             {
-                m_ResourceNames.Add(new ResourceName(name, variant));
+                m_ResourceNames.Add(resourceName);
                 m_TotalLength += length;
+                m_TotalZipLength += zipLength;
             }
         }
     }

@@ -1,17 +1,18 @@
 ﻿//------------------------------------------------------------
 // Game Framework
-// Copyright © 2013-2019 Jiang Yin. All rights reserved.
-// Homepage: http://gameframework.cn/
-// Feedback: mailto:jiangyin@gameframework.cn
+// Copyright © 2013-2020 Jiang Yin. All rights reserved.
+// Homepage: https://gameframework.cn/
+// Feedback: mailto:ellan@gameframework.cn
 //------------------------------------------------------------
 
+using GameFramework.FileSystem;
 using System;
 using System.Collections.Generic;
 using System.IO;
 
 namespace GameFramework.Resource
 {
-    internal partial class ResourceManager
+    internal sealed partial class ResourceManager : GameFrameworkModule, IResourceManager
     {
         /// <summary>
         /// 资源检查器。
@@ -21,12 +22,13 @@ namespace GameFramework.Resource
             private readonly ResourceManager m_ResourceManager;
             private readonly Dictionary<ResourceName, CheckInfo> m_CheckInfos;
             private string m_CurrentVariant;
-            private bool m_VersionListReady;
-            private bool m_ReadOnlyListReady;
-            private bool m_ReadWriteListReady;
+            private bool m_IgnoreOtherVariant;
+            private bool m_UpdatableVersionListReady;
+            private bool m_ReadOnlyVersionListReady;
+            private bool m_ReadWriteVersionListReady;
 
-            public GameFrameworkAction<ResourceName, LoadType, int, int, int, int> ResourceNeedUpdate;
-            public GameFrameworkAction<int, int, int, int> ResourceCheckComplete;
+            public GameFrameworkAction<ResourceName, string, LoadType, int, int, int, int> ResourceNeedUpdate;
+            public GameFrameworkAction<int, int, int, long, long> ResourceCheckComplete;
 
             /// <summary>
             /// 初始化资源检查器的新实例。
@@ -37,9 +39,10 @@ namespace GameFramework.Resource
                 m_ResourceManager = resourceManager;
                 m_CheckInfos = new Dictionary<ResourceName, CheckInfo>();
                 m_CurrentVariant = null;
-                m_VersionListReady = false;
-                m_ReadOnlyListReady = false;
-                m_ReadWriteListReady = false;
+                m_IgnoreOtherVariant = false;
+                m_UpdatableVersionListReady = false;
+                m_ReadOnlyVersionListReady = false;
+                m_ReadWriteVersionListReady = false;
 
                 ResourceNeedUpdate = null;
                 ResourceCheckComplete = null;
@@ -53,20 +56,36 @@ namespace GameFramework.Resource
                 m_CheckInfos.Clear();
             }
 
-            public void CheckResources(string currentVariant)
+            public void CheckResources(string currentVariant, bool ignoreOtherVariant)
             {
                 m_CurrentVariant = currentVariant;
+                m_IgnoreOtherVariant = ignoreOtherVariant;
 
-                TryRecoverReadWriteList();
+                TryRecoverReadWriteVersionList();
 
                 if (m_ResourceManager.m_ResourceHelper == null)
                 {
                     throw new GameFrameworkException("Resource helper is invalid.");
                 }
 
-                m_ResourceManager.m_ResourceHelper.LoadBytes(Utility.Path.GetRemotePath(m_ResourceManager.m_ReadWritePath, Utility.Path.GetResourceNameWithSuffix(VersionListFileName)), ParseVersionList);
-                m_ResourceManager.m_ResourceHelper.LoadBytes(Utility.Path.GetRemotePath(m_ResourceManager.m_ReadOnlyPath, Utility.Path.GetResourceNameWithSuffix(ResourceListFileName)), ParseReadOnlyList);
-                m_ResourceManager.m_ResourceHelper.LoadBytes(Utility.Path.GetRemotePath(m_ResourceManager.m_ReadWritePath, Utility.Path.GetResourceNameWithSuffix(ResourceListFileName)), ParseReadWriteList);
+                if (string.IsNullOrEmpty(m_ResourceManager.m_ReadOnlyPath))
+                {
+                    throw new GameFrameworkException("Readonly path is invalid.");
+                }
+
+                if (string.IsNullOrEmpty(m_ResourceManager.m_ReadWritePath))
+                {
+                    throw new GameFrameworkException("Read-write path is invalid.");
+                }
+
+                m_ResourceManager.m_ResourceHelper.LoadBytes(Utility.Path.GetRemotePath(Path.Combine(m_ResourceManager.m_ReadWritePath, RemoteVersionListFileName)), new LoadBytesCallbacks(OnLoadUpdatableVersionListSuccess, OnLoadUpdatableVersionListFailure), null);
+                m_ResourceManager.m_ResourceHelper.LoadBytes(Utility.Path.GetRemotePath(Path.Combine(m_ResourceManager.m_ReadOnlyPath, LocalVersionListFileName)), new LoadBytesCallbacks(OnLoadReadOnlyVersionListSuccess, OnLoadReadOnlyVersionListFailure), null);
+                m_ResourceManager.m_ResourceHelper.LoadBytes(Utility.Path.GetRemotePath(Path.Combine(m_ResourceManager.m_ReadWritePath, LocalVersionListFileName)), new LoadBytesCallbacks(OnLoadReadWriteVersionListSuccess, OnLoadReadWriteVersionListFailure), null);
+            }
+
+            private void SetCachedFileSystemName(ResourceName resourceName, string fileSystemName)
+            {
+                GetOrAddCheckInfo(resourceName).SetCachedFileSystemName(fileSystemName);
             }
 
             private void SetVersionInfo(ResourceName resourceName, LoadType loadType, int length, int hashCode, int zipLength, int zipHashCode)
@@ -100,37 +119,69 @@ namespace GameFramework.Resource
 
             private void RefreshCheckInfoStatus()
             {
-                if (!m_VersionListReady || !m_ReadOnlyListReady || !m_ReadWriteListReady)
+                if (!m_UpdatableVersionListReady || !m_ReadOnlyVersionListReady || !m_ReadWriteVersionListReady)
                 {
                     return;
                 }
 
+                int movedCount = 0;
                 int removedCount = 0;
                 int updateCount = 0;
-                int updateTotalLength = 0;
-                int updateTotalZipLength = 0;
+                long updateTotalLength = 0L;
+                long updateTotalZipLength = 0L;
                 foreach (KeyValuePair<ResourceName, CheckInfo> checkInfo in m_CheckInfos)
                 {
                     CheckInfo ci = checkInfo.Value;
-                    ci.RefreshStatus(m_CurrentVariant);
-
+                    ci.RefreshStatus(m_CurrentVariant, m_IgnoreOtherVariant);
                     if (ci.Status == CheckInfo.CheckStatus.StorageInReadOnly)
                     {
-                        ProcessResourceInfo(ci.ResourceName, ci.LoadType, ci.Length, ci.HashCode, true);
+                        m_ResourceManager.m_ResourceInfos.Add(ci.ResourceName, new ResourceInfo(ci.ResourceName, ci.FileSystemName, ci.LoadType, ci.Length, ci.HashCode, true, true));
                     }
                     else if (ci.Status == CheckInfo.CheckStatus.StorageInReadWrite)
                     {
-                        ProcessResourceInfo(ci.ResourceName, ci.LoadType, ci.Length, ci.HashCode, false);
+                        if (ci.NeedMoveToDisk || ci.NeedMoveToFileSystem)
+                        {
+                            movedCount++;
+                            string resourceFullName = ci.ResourceName.FullName;
+                            string resourcePath = Utility.Path.GetRegularPath(Path.Combine(m_ResourceManager.m_ReadWritePath, resourceFullName));
+                            if (ci.NeedMoveToDisk)
+                            {
+                                IFileSystem fileSystem = m_ResourceManager.GetFileSystem(ci.ReadWriteFileSystemName, false);
+                                if (!fileSystem.SaveAsFile(resourceFullName, resourcePath))
+                                {
+                                    throw new GameFrameworkException(Utility.Text.Format("Save as file '{0}' to '{1}' from file system '{2}' error.", resourceFullName, fileSystem.FullPath));
+                                }
+
+                                fileSystem.DeleteFile(resourceFullName);
+                            }
+
+                            if (ci.NeedMoveToFileSystem)
+                            {
+                                IFileSystem fileSystem = m_ResourceManager.GetFileSystem(ci.FileSystemName, false);
+                                if (!fileSystem.WriteFile(resourceFullName, resourcePath))
+                                {
+                                    throw new GameFrameworkException(Utility.Text.Format("Write resource '{0}' to file system '{1}' error.", resourceFullName, fileSystem.FullPath));
+                                }
+
+                                if (File.Exists(resourcePath))
+                                {
+                                    File.Delete(resourcePath);
+                                }
+                            }
+                        }
+
+                        m_ResourceManager.m_ResourceInfos.Add(ci.ResourceName, new ResourceInfo(ci.ResourceName, ci.FileSystemName, ci.LoadType, ci.Length, ci.HashCode, false, true));
+                        m_ResourceManager.m_ReadWriteResourceInfos.Add(ci.ResourceName, new ReadWriteResourceInfo(ci.FileSystemName, ci.LoadType, ci.Length, ci.HashCode));
                     }
-                    else if (ci.Status == CheckInfo.CheckStatus.NeedUpdate)
+                    else if (ci.Status == CheckInfo.CheckStatus.Update)
                     {
+                        m_ResourceManager.m_ResourceInfos.Add(ci.ResourceName, new ResourceInfo(ci.ResourceName, ci.FileSystemName, ci.LoadType, ci.Length, ci.HashCode, false, false));
                         updateCount++;
                         updateTotalLength += ci.Length;
                         updateTotalZipLength += ci.ZipLength;
-
-                        ResourceNeedUpdate(ci.ResourceName, ci.LoadType, ci.Length, ci.HashCode, ci.ZipLength, ci.ZipHashCode);
+                        ResourceNeedUpdate(ci.ResourceName, ci.FileSystemName, ci.LoadType, ci.Length, ci.HashCode, ci.ZipLength, ci.ZipHashCode);
                     }
-                    else if (ci.Status == CheckInfo.CheckStatus.Disuse || ci.Status == CheckInfo.CheckStatus.Unavailable)
+                    else if (ci.Status == CheckInfo.CheckStatus.Unavailable || ci.Status == CheckInfo.CheckStatus.Disuse)
                     {
                         // Do nothing.
                     }
@@ -142,30 +193,39 @@ namespace GameFramework.Resource
                     if (ci.NeedRemove)
                     {
                         removedCount++;
-
-                        string path = Utility.Path.GetCombinePath(m_ResourceManager.m_ReadWritePath, Utility.Path.GetResourceNameWithSuffix(ci.ResourceName.FullName));
-                        File.Delete(path);
-
-                        if (!m_ResourceManager.m_ReadWriteResourceInfos.ContainsKey(ci.ResourceName))
+                        if (ci.ReadWriteUseFileSystem)
                         {
-                            throw new GameFrameworkException(Utility.Text.Format("Resource '{0}' is not exist in read-write list.", ci.ResourceName.FullName));
+                            IFileSystem fileSystem = m_ResourceManager.GetFileSystem(ci.ReadWriteFileSystemName, false);
+                            fileSystem.DeleteFile(ci.ResourceName.FullName);
                         }
-
-                        m_ResourceManager.m_ReadWriteResourceInfos.Remove(ci.ResourceName);
+                        else
+                        {
+                            string resourcePath = Utility.Path.GetRegularPath(Path.Combine(m_ResourceManager.m_ReadWritePath, ci.ResourceName.FullName));
+                            if (File.Exists(resourcePath))
+                            {
+                                File.Delete(resourcePath);
+                            }
+                        }
                     }
                 }
 
-                ResourceCheckComplete(removedCount, updateCount, updateTotalLength, updateTotalZipLength);
+                if (movedCount > 0 || removedCount > 0)
+                {
+                    RemoveEmptyFileSystems();
+                    Utility.Path.RemoveEmptyDirectory(m_ResourceManager.m_ReadWritePath);
+                }
+
+                ResourceCheckComplete(movedCount, removedCount, updateCount, updateTotalLength, updateTotalZipLength);
             }
 
             /// <summary>
-            /// 尝试恢复读写区资源列表。
+            /// 尝试恢复读写区版本资源列表。
             /// </summary>
             /// <returns>是否恢复成功。</returns>
-            private bool TryRecoverReadWriteList()
+            private bool TryRecoverReadWriteVersionList()
             {
-                string file = Utility.Path.GetCombinePath(m_ResourceManager.m_ReadWritePath, Utility.Path.GetResourceNameWithSuffix(ResourceListFileName));
-                string backupFile = file + BackupFileSuffixName;
+                string file = Utility.Path.GetRegularPath(Path.Combine(m_ResourceManager.m_ReadWritePath, LocalVersionListFileName));
+                string backupFile = Utility.Text.Format("{0}.{1}", file, BackupExtension);
 
                 try
                 {
@@ -189,127 +249,119 @@ namespace GameFramework.Resource
                 return true;
             }
 
-            /// <summary>
-            /// 解析版本资源列表。
-            /// </summary>
-            /// <param name="fileUri">版本资源列表文件路径。</param>
-            /// <param name="bytes">要解析的数据。</param>
-            /// <param name="errorMessage">错误信息。</param>
-            private void ParseVersionList(string fileUri, byte[] bytes, string errorMessage)
+            private void RemoveEmptyFileSystems()
             {
-                if (m_VersionListReady)
+                List<string> removedFileSystemNames = null;
+                foreach (KeyValuePair<string, IFileSystem> fileSystem in m_ResourceManager.m_ReadWriteFileSystems)
                 {
-                    throw new GameFrameworkException("Version list has been parsed.");
+                    if (fileSystem.Value.FileCount <= 0)
+                    {
+                        if (removedFileSystemNames == null)
+                        {
+                            removedFileSystemNames = new List<string>();
+                        }
+
+                        m_ResourceManager.m_FileSystemManager.DestroyFileSystem(fileSystem.Value, true);
+                        removedFileSystemNames.Add(fileSystem.Key);
+                    }
                 }
 
-                if (bytes == null || bytes.Length <= 0)
+                if (removedFileSystemNames != null)
                 {
-                    throw new GameFrameworkException(Utility.Text.Format("Version list '{0}' is invalid, error message is '{1}'.", fileUri, string.IsNullOrEmpty(errorMessage) ? "<Empty>" : errorMessage));
+                    foreach (string removedFileSystemName in removedFileSystemNames)
+                    {
+                        m_ResourceManager.m_ReadWriteFileSystems.Remove(removedFileSystemName);
+                    }
+                }
+            }
+
+            private void OnLoadUpdatableVersionListSuccess(string fileUri, byte[] bytes, float duration, object userData)
+            {
+                if (m_UpdatableVersionListReady)
+                {
+                    throw new GameFrameworkException("Updatable version list has been parsed.");
                 }
 
                 MemoryStream memoryStream = null;
                 try
                 {
-                    memoryStream = new MemoryStream(bytes);
-                    using (BinaryReader binaryReader = new BinaryReader(memoryStream))
+                    memoryStream = new MemoryStream(bytes, false);
+                    UpdatableVersionList versionList = m_ResourceManager.m_UpdatableVersionListSerializer.Deserialize(memoryStream);
+                    if (!versionList.IsValid)
                     {
-                        memoryStream = null;
-                        char[] header = binaryReader.ReadChars(3);
-                        if (header[0] != VersionListHeader[0] || header[1] != VersionListHeader[1] || header[2] != VersionListHeader[2])
+                        throw new GameFrameworkException("Deserialize updatable version list failure.");
+                    }
+
+                    UpdatableVersionList.Asset[] assets = versionList.GetAssets();
+                    UpdatableVersionList.Resource[] resources = versionList.GetResources();
+                    UpdatableVersionList.FileSystem[] fileSystems = versionList.GetFileSystems();
+                    UpdatableVersionList.ResourceGroup[] resourceGroups = versionList.GetResourceGroups();
+                    m_ResourceManager.m_ApplicableGameVersion = versionList.ApplicableGameVersion;
+                    m_ResourceManager.m_InternalResourceVersion = versionList.InternalResourceVersion;
+                    m_ResourceManager.m_AssetInfos = new Dictionary<string, AssetInfo>(assets.Length, StringComparer.Ordinal);
+                    m_ResourceManager.m_ResourceInfos = new Dictionary<ResourceName, ResourceInfo>(resources.Length, new ResourceNameComparer());
+                    m_ResourceManager.m_ReadWriteResourceInfos = new SortedDictionary<ResourceName, ReadWriteResourceInfo>(new ResourceNameComparer());
+                    ResourceGroup defaultResourceGroup = m_ResourceManager.GetOrAddResourceGroup(string.Empty);
+
+                    foreach (UpdatableVersionList.FileSystem fileSystem in fileSystems)
+                    {
+                        int[] resourceIndexes = fileSystem.GetResourceIndexes();
+                        foreach (int resourceIndex in resourceIndexes)
                         {
-                            throw new GameFrameworkException("Version list header is invalid.");
-                        }
-
-                        byte listVersion = binaryReader.ReadByte();
-
-                        if (listVersion == 0)
-                        {
-                            byte[] encryptBytes = binaryReader.ReadBytes(4);
-                            m_ResourceManager.m_ApplicableGameVersion = Utility.Converter.GetString(Utility.Encryption.GetSelfXorBytes(binaryReader.ReadBytes(binaryReader.ReadByte()), encryptBytes));
-                            m_ResourceManager.m_InternalResourceVersion = binaryReader.ReadInt32();
-
-                            int resourceCount = binaryReader.ReadInt32();
-                            string[] names = new string[resourceCount];
-                            string[] variants = new string[resourceCount];
-                            int[] lengths = new int[resourceCount];
-                            Dictionary<string, string[]> dependencyAssetNamesCollection = new Dictionary<string, string[]>();
-                            for (int i = 0; i < resourceCount; i++)
+                            UpdatableVersionList.Resource resource = resources[resourceIndex];
+                            if (resource.Variant != null && resource.Variant != m_CurrentVariant)
                             {
-                                names[i] = Utility.Converter.GetString(Utility.Encryption.GetSelfXorBytes(binaryReader.ReadBytes(binaryReader.ReadByte()), encryptBytes));
-
-                                variants[i] = null;
-                                byte variantLength = binaryReader.ReadByte();
-                                if (variantLength > 0)
-                                {
-                                    variants[i] = Utility.Converter.GetString(Utility.Encryption.GetSelfXorBytes(binaryReader.ReadBytes(variantLength), encryptBytes));
-                                }
-
-                                LoadType loadType = (LoadType)binaryReader.ReadByte();
-                                lengths[i] = binaryReader.ReadInt32();
-                                int hashCode = binaryReader.ReadInt32();
-                                int zipLength = binaryReader.ReadInt32();
-                                int zipHashCode = binaryReader.ReadInt32();
-
-                                int assetNamesCount = binaryReader.ReadInt32();
-                                string[] assetNames = new string[assetNamesCount];
-                                for (int j = 0; j < assetNamesCount; j++)
-                                {
-                                    assetNames[j] = Utility.Converter.GetString(Utility.Encryption.GetSelfXorBytes(binaryReader.ReadBytes(binaryReader.ReadByte()), Utility.Converter.GetBytes(hashCode)));
-
-                                    int dependencyAssetNamesCount = binaryReader.ReadInt32();
-                                    string[] dependencyAssetNames = new string[dependencyAssetNamesCount];
-                                    for (int k = 0; k < dependencyAssetNamesCount; k++)
-                                    {
-                                        dependencyAssetNames[k] = Utility.Converter.GetString(Utility.Encryption.GetSelfXorBytes(binaryReader.ReadBytes(binaryReader.ReadByte()), Utility.Converter.GetBytes(hashCode)));
-                                    }
-
-                                    if (variants[i] == null || variants[i] == m_CurrentVariant)
-                                    {
-                                        dependencyAssetNamesCollection.Add(assetNames[j], dependencyAssetNames);
-                                    }
-                                }
-
-                                ResourceName resourceName = new ResourceName(names[i], variants[i]);
-                                SetVersionInfo(resourceName, loadType, lengths[i], hashCode, zipLength, zipHashCode);
-                                if (variants[i] == null || variants[i] == m_CurrentVariant)
-                                {
-                                    ProcessAssetInfo(resourceName, assetNames);
-                                }
+                                continue;
                             }
 
-                            ProcessAssetDependencyInfo(dependencyAssetNamesCollection);
-
-                            ResourceGroup resourceGroupAll = m_ResourceManager.GetResourceGroup(string.Empty);
-                            for (int i = 0; i < resourceCount; i++)
-                            {
-                                resourceGroupAll.AddResource(names[i], variants[i], lengths[i]);
-                            }
-
-                            int resourceGroupCount = binaryReader.ReadInt32();
-                            for (int i = 0; i < resourceGroupCount; i++)
-                            {
-                                string groupName = Utility.Converter.GetString(Utility.Encryption.GetSelfXorBytes(binaryReader.ReadBytes(binaryReader.ReadByte()), encryptBytes));
-                                ResourceGroup resourceGroup = m_ResourceManager.GetResourceGroup(groupName);
-                                int groupResourceCount = binaryReader.ReadInt32();
-                                for (int j = 0; j < groupResourceCount; j++)
-                                {
-                                    ushort versionIndex = binaryReader.ReadUInt16();
-                                    if (versionIndex >= resourceCount)
-                                    {
-                                        throw new GameFrameworkException(Utility.Text.Format("Version index '{0}' is invalid, resource count is '{1}'.", versionIndex, resourceCount));
-                                    }
-
-                                    resourceGroup.AddResource(names[versionIndex], variants[versionIndex], lengths[versionIndex]);
-                                }
-                            }
-                        }
-                        else
-                        {
-                            throw new GameFrameworkException("Version list version is invalid.");
+                            SetCachedFileSystemName(new ResourceName(resource.Name, resource.Variant, resource.Extension), fileSystem.Name);
                         }
                     }
 
-                    m_VersionListReady = true;
+                    foreach (UpdatableVersionList.Resource resource in resources)
+                    {
+                        if (resource.Variant != null && resource.Variant != m_CurrentVariant)
+                        {
+                            continue;
+                        }
+
+                        ResourceName resourceName = new ResourceName(resource.Name, resource.Variant, resource.Extension);
+                        int[] assetIndexes = resource.GetAssetIndexes();
+                        foreach (int assetIndex in assetIndexes)
+                        {
+                            UpdatableVersionList.Asset asset = assets[assetIndex];
+                            int[] dependencyAssetIndexes = asset.GetDependencyAssetIndexes();
+                            int index = 0;
+                            string[] dependencyAssetNames = new string[dependencyAssetIndexes.Length];
+                            foreach (int dependencyAssetIndex in dependencyAssetIndexes)
+                            {
+                                dependencyAssetNames[index++] = assets[dependencyAssetIndex].Name;
+                            }
+
+                            m_ResourceManager.m_AssetInfos.Add(asset.Name, new AssetInfo(asset.Name, resourceName, dependencyAssetNames));
+                        }
+
+                        SetVersionInfo(resourceName, (LoadType)resource.LoadType, resource.Length, resource.HashCode, resource.ZipLength, resource.ZipHashCode);
+                        defaultResourceGroup.AddResource(resourceName, resource.Length, resource.ZipLength);
+                    }
+
+                    foreach (UpdatableVersionList.ResourceGroup resourceGroup in resourceGroups)
+                    {
+                        ResourceGroup group = m_ResourceManager.GetOrAddResourceGroup(resourceGroup.Name);
+                        int[] resourceIndexes = resourceGroup.GetResourceIndexes();
+                        foreach (int resourceIndex in resourceIndexes)
+                        {
+                            UpdatableVersionList.Resource resource = resources[resourceIndex];
+                            if (resource.Variant != null && resource.Variant != m_CurrentVariant)
+                            {
+                                continue;
+                            }
+
+                            group.AddResource(new ResourceName(resource.Name, resource.Variant, resource.Extension), resource.Length, resource.ZipLength);
+                        }
+                    }
+
+                    m_UpdatableVersionListReady = true;
                     RefreshCheckInfoStatus();
                 }
                 catch (Exception exception)
@@ -319,7 +371,7 @@ namespace GameFramework.Resource
                         throw;
                     }
 
-                    throw new GameFrameworkException(Utility.Text.Format("Parse version list exception '{0}'.", exception.Message), exception);
+                    throw new GameFrameworkException(Utility.Text.Format("Parse updatable version list exception '{0}'.", exception.ToString()), exception);
                 }
                 finally
                 {
@@ -331,71 +383,47 @@ namespace GameFramework.Resource
                 }
             }
 
-            /// <summary>
-            /// 解析只读区资源列表。
-            /// </summary>
-            /// <param name="fileUri">只读区资源列表文件路径。</param>
-            /// <param name="bytes">要解析的数据。</param>
-            /// <param name="errorMessage">错误信息。</param>
-            private void ParseReadOnlyList(string fileUri, byte[] bytes, string errorMessage)
+            private void OnLoadUpdatableVersionListFailure(string fileUri, string errorMessage, object userData)
             {
-                if (m_ReadOnlyListReady)
-                {
-                    throw new GameFrameworkException("Readonly list has been parsed.");
-                }
+                throw new GameFrameworkException(Utility.Text.Format("Updatable version list '{0}' is invalid, error message is '{1}'.", fileUri, string.IsNullOrEmpty(errorMessage) ? "<Empty>" : errorMessage));
+            }
 
-                if (bytes == null || bytes.Length <= 0)
+            private void OnLoadReadOnlyVersionListSuccess(string fileUri, byte[] bytes, float duration, object userData)
+            {
+                if (m_ReadOnlyVersionListReady)
                 {
-                    m_ReadOnlyListReady = true;
-                    RefreshCheckInfoStatus();
-                    return;
+                    throw new GameFrameworkException("Read only version list has been parsed.");
                 }
 
                 MemoryStream memoryStream = null;
                 try
                 {
-                    memoryStream = new MemoryStream(bytes);
-                    using (BinaryReader binaryReader = new BinaryReader(memoryStream))
+                    memoryStream = new MemoryStream(bytes, false);
+                    LocalVersionList versionList = m_ResourceManager.m_ReadOnlyVersionListSerializer.Deserialize(memoryStream);
+                    if (!versionList.IsValid)
                     {
-                        memoryStream = null;
-                        char[] header = binaryReader.ReadChars(3);
-                        if (header[0] != ReadOnlyListHeader[0] || header[1] != ReadOnlyListHeader[1] || header[2] != ReadOnlyListHeader[2])
+                        throw new GameFrameworkException("Deserialize read only version list failure.");
+                    }
+
+                    LocalVersionList.Resource[] resources = versionList.GetResources();
+                    LocalVersionList.FileSystem[] fileSystems = versionList.GetFileSystems();
+
+                    foreach (LocalVersionList.FileSystem fileSystem in fileSystems)
+                    {
+                        int[] resourceIndexes = fileSystem.GetResourceIndexes();
+                        foreach (int resourceIndex in resourceIndexes)
                         {
-                            throw new GameFrameworkException("Readonly list header is invalid.");
-                        }
-
-                        byte listVersion = binaryReader.ReadByte();
-
-                        if (listVersion == 0)
-                        {
-                            byte[] encryptBytes = binaryReader.ReadBytes(4);
-
-                            int resourceCount = binaryReader.ReadInt32();
-                            for (int i = 0; i < resourceCount; i++)
-                            {
-                                string name = Utility.Converter.GetString(Utility.Encryption.GetSelfXorBytes(binaryReader.ReadBytes(binaryReader.ReadByte()), encryptBytes));
-
-                                string variant = null;
-                                byte variantLength = binaryReader.ReadByte();
-                                if (variantLength > 0)
-                                {
-                                    variant = Utility.Converter.GetString(Utility.Encryption.GetSelfXorBytes(binaryReader.ReadBytes(variantLength), encryptBytes));
-                                }
-
-                                LoadType loadType = (LoadType)binaryReader.ReadByte();
-                                int length = binaryReader.ReadInt32();
-                                int hashCode = binaryReader.ReadInt32();
-
-                                SetReadOnlyInfo(new ResourceName(name, variant), loadType, length, hashCode);
-                            }
-                        }
-                        else
-                        {
-                            throw new GameFrameworkException("Readonly list version is invalid.");
+                            LocalVersionList.Resource resource = resources[resourceIndex];
+                            SetCachedFileSystemName(new ResourceName(resource.Name, resource.Variant, resource.Extension), fileSystem.Name);
                         }
                     }
 
-                    m_ReadOnlyListReady = true;
+                    foreach (LocalVersionList.Resource resource in resources)
+                    {
+                        SetReadOnlyInfo(new ResourceName(resource.Name, resource.Variant, resource.Extension), (LoadType)resource.LoadType, resource.Length, resource.HashCode);
+                    }
+
+                    m_ReadOnlyVersionListReady = true;
                     RefreshCheckInfoStatus();
                 }
                 catch (Exception exception)
@@ -405,7 +433,7 @@ namespace GameFramework.Resource
                         throw;
                     }
 
-                    throw new GameFrameworkException(Utility.Text.Format("Parse readonly list exception '{0}'.", exception.Message), exception);
+                    throw new GameFrameworkException(Utility.Text.Format("Parse read only version list exception '{0}'.", exception.ToString()), exception);
                 }
                 finally
                 {
@@ -417,79 +445,54 @@ namespace GameFramework.Resource
                 }
             }
 
-            /// <summary>
-            /// 解析读写区资源列表。
-            /// </summary>
-            /// <param name="fileUri">读写区资源列表文件路径。</param>
-            /// <param name="bytes">要解析的数据。</param>
-            /// <param name="errorMessage">错误信息。</param>
-            private void ParseReadWriteList(string fileUri, byte[] bytes, string errorMessage)
+            private void OnLoadReadOnlyVersionListFailure(string fileUri, string errorMessage, object userData)
             {
-                if (m_ReadWriteListReady)
+                if (m_ReadOnlyVersionListReady)
                 {
-                    throw new GameFrameworkException("Read-write list has been parsed.");
+                    throw new GameFrameworkException("Read only version list has been parsed.");
                 }
 
-                if (bytes == null || bytes.Length <= 0)
+                m_ReadOnlyVersionListReady = true;
+                RefreshCheckInfoStatus();
+            }
+
+            private void OnLoadReadWriteVersionListSuccess(string fileUri, byte[] bytes, float duration, object userData)
+            {
+                if (m_ReadWriteVersionListReady)
                 {
-                    m_ReadWriteListReady = true;
-                    RefreshCheckInfoStatus();
-                    return;
+                    throw new GameFrameworkException("Read write version list has been parsed.");
                 }
 
                 MemoryStream memoryStream = null;
                 try
                 {
-                    memoryStream = new MemoryStream(bytes);
-                    using (BinaryReader binaryReader = new BinaryReader(memoryStream))
+                    memoryStream = new MemoryStream(bytes, false);
+                    LocalVersionList versionList = m_ResourceManager.m_ReadWriteVersionListSerializer.Deserialize(memoryStream);
+                    if (!versionList.IsValid)
                     {
-                        memoryStream = null;
-                        char[] header = binaryReader.ReadChars(3);
-                        if (header[0] != ReadWriteListHeader[0] || header[1] != ReadWriteListHeader[1] || header[2] != ReadWriteListHeader[2])
+                        throw new GameFrameworkException("Deserialize read write version list failure.");
+                    }
+
+                    LocalVersionList.Resource[] resources = versionList.GetResources();
+                    LocalVersionList.FileSystem[] fileSystems = versionList.GetFileSystems();
+
+                    foreach (LocalVersionList.FileSystem fileSystem in fileSystems)
+                    {
+                        int[] resourceIndexes = fileSystem.GetResourceIndexes();
+                        foreach (int resourceIndex in resourceIndexes)
                         {
-                            throw new GameFrameworkException("Read-write list header is invalid.");
-                        }
-
-                        byte listVersion = binaryReader.ReadByte();
-
-                        if (listVersion == 0)
-                        {
-                            byte[] encryptBytes = binaryReader.ReadBytes(4);
-
-                            int resourceCount = binaryReader.ReadInt32();
-                            for (int i = 0; i < resourceCount; i++)
-                            {
-                                string name = Utility.Converter.GetString(Utility.Encryption.GetSelfXorBytes(binaryReader.ReadBytes(binaryReader.ReadByte()), encryptBytes));
-
-                                string variant = null;
-                                byte variantLength = binaryReader.ReadByte();
-                                if (variantLength > 0)
-                                {
-                                    variant = Utility.Converter.GetString(Utility.Encryption.GetSelfXorBytes(binaryReader.ReadBytes(variantLength), encryptBytes));
-                                }
-
-                                LoadType loadType = (LoadType)binaryReader.ReadByte();
-                                int length = binaryReader.ReadInt32();
-                                int hashCode = binaryReader.ReadInt32();
-
-                                SetReadWriteInfo(new ResourceName(name, variant), loadType, length, hashCode);
-
-                                ResourceName resourceName = new ResourceName(name, variant);
-                                if (m_ResourceManager.m_ReadWriteResourceInfos.ContainsKey(resourceName))
-                                {
-                                    throw new GameFrameworkException(Utility.Text.Format("Read-write resource info '{0}' is already exist.", resourceName.FullName));
-                                }
-
-                                m_ResourceManager.m_ReadWriteResourceInfos.Add(resourceName, new ReadWriteResourceInfo(loadType, length, hashCode));
-                            }
-                        }
-                        else
-                        {
-                            throw new GameFrameworkException("Read-write list version is invalid.");
+                            LocalVersionList.Resource resource = resources[resourceIndex];
+                            SetCachedFileSystemName(new ResourceName(resource.Name, resource.Variant, resource.Extension), fileSystem.Name);
                         }
                     }
 
-                    m_ReadWriteListReady = true;
+                    foreach (LocalVersionList.Resource resource in resources)
+                    {
+                        ResourceName resourceName = new ResourceName(resource.Name, resource.Variant, resource.Extension);
+                        SetReadWriteInfo(resourceName, (LoadType)resource.LoadType, resource.Length, resource.HashCode);
+                    }
+
+                    m_ReadWriteVersionListReady = true;
                     RefreshCheckInfoStatus();
                 }
                 catch (Exception exception)
@@ -499,7 +502,7 @@ namespace GameFramework.Resource
                         throw;
                     }
 
-                    throw new GameFrameworkException(Utility.Text.Format("Parse read-write list exception '{0}'.", exception.Message), exception);
+                    throw new GameFrameworkException(Utility.Text.Format("Parse read write version list exception '{0}'.", exception.ToString()), exception);
                 }
                 finally
                 {
@@ -511,51 +514,15 @@ namespace GameFramework.Resource
                 }
             }
 
-            private void ProcessAssetInfo(ResourceName resourceName, string[] assetNames)
+            private void OnLoadReadWriteVersionListFailure(string fileUri, string errorMessage, object userData)
             {
-                foreach (string assetName in assetNames)
+                if (m_ReadWriteVersionListReady)
                 {
-                    int childNamePosition = assetName.LastIndexOf('/');
-                    if (childNamePosition < 0 || childNamePosition + 1 >= assetName.Length)
-                    {
-                        throw new GameFrameworkException(Utility.Text.Format("Asset name '{0}' is invalid.", assetName));
-                    }
-
-                    m_ResourceManager.m_AssetInfos.Add(assetName, new AssetInfo(assetName, resourceName, assetName.Substring(childNamePosition + 1)));
-                }
-            }
-
-            private void ProcessAssetDependencyInfo(Dictionary<string, string[]> dependencyAssetNamesCollection)
-            {
-                foreach (KeyValuePair<string, string[]> dependencyAssetNamesCollectionItem in dependencyAssetNamesCollection)
-                {
-                    List<string> dependencyAssetNames = new List<string>();
-                    List<string> scatteredDependencyAssetNames = new List<string>();
-                    foreach (string dependencyAssetName in dependencyAssetNamesCollectionItem.Value)
-                    {
-                        AssetInfo? assetInfo = m_ResourceManager.GetAssetInfo(dependencyAssetName);
-                        if (assetInfo.HasValue)
-                        {
-                            dependencyAssetNames.Add(dependencyAssetName);
-                        }
-                        else
-                        {
-                            scatteredDependencyAssetNames.Add(dependencyAssetName);
-                        }
-                    }
-
-                    m_ResourceManager.m_AssetDependencyInfos.Add(dependencyAssetNamesCollectionItem.Key, new AssetDependencyInfo(dependencyAssetNamesCollectionItem.Key, dependencyAssetNames.ToArray(), scatteredDependencyAssetNames.ToArray()));
-                }
-            }
-
-            private void ProcessResourceInfo(ResourceName resourceName, LoadType loadType, int length, int hashCode, bool storageInReadOnly)
-            {
-                if (m_ResourceManager.m_ResourceInfos.ContainsKey(resourceName))
-                {
-                    throw new GameFrameworkException(Utility.Text.Format("Resource info '{0}' is already exist.", resourceName.FullName));
+                    throw new GameFrameworkException("Read write version list has been parsed.");
                 }
 
-                m_ResourceManager.m_ResourceInfos.Add(resourceName, new ResourceInfo(resourceName, loadType, length, hashCode, storageInReadOnly));
+                m_ReadWriteVersionListReady = true;
+                RefreshCheckInfoStatus();
             }
         }
     }

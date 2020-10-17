@@ -1,19 +1,20 @@
 ﻿//------------------------------------------------------------
 // Game Framework
-// Copyright © 2013-2019 Jiang Yin. All rights reserved.
-// Homepage: http://gameframework.cn/
-// Feedback: mailto:jiangyin@gameframework.cn
+// Copyright © 2013-2020 Jiang Yin. All rights reserved.
+// Homepage: https://gameframework.cn/
+// Feedback: mailto:ellan@gameframework.cn
 //------------------------------------------------------------
 
 namespace GameFramework.Entity
 {
-    internal partial class EntityManager
+    internal sealed partial class EntityManager : GameFrameworkModule, IEntityManager
     {
         /// <summary>
         /// 实体状态。
         /// </summary>
-        private enum EntityStatus
+        private enum EntityStatus : byte
         {
+            Unknown = 0,
             WillInit,
             Inited,
             WillShow,
@@ -21,7 +22,7 @@ namespace GameFramework.Entity
             WillHide,
             Hidden,
             WillRecycle,
-            Recycled,
+            Recycled
         }
     }
 }

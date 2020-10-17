@@ -1,24 +1,24 @@
 ﻿//------------------------------------------------------------
 // Game Framework
-// Copyright © 2013-2019 Jiang Yin. All rights reserved.
-// Homepage: http://gameframework.cn/
-// Feedback: mailto:jiangyin@gameframework.cn
+// Copyright © 2013-2020 Jiang Yin. All rights reserved.
+// Homepage: https://gameframework.cn/
+// Feedback: mailto:ellan@gameframework.cn
 //------------------------------------------------------------
 
 namespace GameFramework.Download
 {
-    internal partial class DownloadManager
+    internal sealed partial class DownloadManager : GameFrameworkModule, IDownloadManager
     {
-        private partial class DownloadCounter
+        private sealed partial class DownloadCounter
         {
-            private sealed class DownloadCounterNode
+            private sealed class DownloadCounterNode : IReference
             {
-                private readonly int m_DownloadedLength;
+                private int m_DownloadedLength;
                 private float m_ElapseSeconds;
 
-                public DownloadCounterNode(int downloadedLength)
+                public DownloadCounterNode()
                 {
-                    m_DownloadedLength = downloadedLength;
+                    m_DownloadedLength = 0;
                     m_ElapseSeconds = 0f;
                 }
 
@@ -38,9 +38,27 @@ namespace GameFramework.Download
                     }
                 }
 
+                public static DownloadCounterNode Create(int downloadedLength)
+                {
+                    DownloadCounterNode downloadCounterNode = ReferencePool.Acquire<DownloadCounterNode>();
+                    downloadCounterNode.m_DownloadedLength = downloadedLength;
+                    return downloadCounterNode;
+                }
+
                 public void Update(float elapseSeconds, float realElapseSeconds)
                 {
                     m_ElapseSeconds += realElapseSeconds;
+                }
+
+                public void AddDownloadedLength(int downloadedLength)
+                {
+                    m_DownloadedLength += downloadedLength;
+                }
+
+                public void Clear()
+                {
+                    m_DownloadedLength = 0;
+                    m_ElapseSeconds = 0f;
                 }
             }
         }
